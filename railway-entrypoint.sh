@@ -17,6 +17,10 @@
 # either exits, the other is stopped and the container exits nonzero so
 # Railway's ON_FAILURE restart policy brings the service back.
 set -euo pipefail
+# Bash as PID 1 ignores TERM and INT without a handler. Until a step installs
+# its own, a stop request ends the wrapper; an unfinished provisioning resumes
+# on the next boot because its marker is still on the volume.
+trap 'exit 143' TERM INT
 
 data=/data
 jellyfin_data="${data}/jellyfin"
@@ -204,7 +208,7 @@ provision() {
   rm -f /tmp/bootstrap-response
 
   stop_pid "${jellyfin_pid}"
-  trap - TERM INT
+  trap 'exit 143' TERM INT
   wizard_completed || { echo "railway-entrypoint: Jellyfin did not record the completed wizard." >&2; exit 1; }
   finish_network_config
   echo "railway-entrypoint: startup wizard completed for admin user ${username}; libraries Movies, Shows and Music created."
@@ -223,6 +227,15 @@ if needs_provisioning; then
   fail "provisioning is not finished and JELLYFIN_ADMIN_PASSWORD is not set."
 fi
 
+stopping=0
+jellyfin_pid=""
+dufs_pid=""
+stop() {
+  kill -TERM ${jellyfin_pid:+"${jellyfin_pid}"} ${dufs_pid:+"${dufs_pid}"} 2>/dev/null || true
+}
+# Installed before the children start, so a stop request is never ignored.
+trap 'stopping=1; stop' TERM INT
+
 dufs "${media_dir}" \
   --bind 0.0.0.0 --bind :: \
   --port "${upload_port}" \
@@ -232,12 +245,8 @@ dufs "${media_dir}" \
 dufs_pid=$!
 
 start_jellyfin
-
-stopping=0
-stop() {
-  kill -TERM "${jellyfin_pid}" "${dufs_pid}" 2>/dev/null || true
-}
-trap 'stopping=1; stop' TERM INT
+# A stop that arrived while the children were starting.
+(( stopping == 0 )) || stop
 
 status=0
 wait -n "${jellyfin_pid}" "${dufs_pid}" || status=$?

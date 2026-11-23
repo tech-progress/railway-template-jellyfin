@@ -13,8 +13,8 @@ image="${IMAGE:-jellyfin-media-server:local}"
 work="$(mktemp -d)"
 name="jellyfin-interrupted-$$"
 cleanup() {
-  "${engine}" rm -f "${name}-seed" "${name}" >/dev/null 2>&1 || true
-  "${engine}" volume rm -f "${name}" >/dev/null 2>&1 || true
+  "${engine}" rm -fv "${name}-seed" "${name}" "${name}-term" >/dev/null 2>&1 || true
+  "${engine}" volume rm -f "${name}" "${name}-term" >/dev/null 2>&1 || true
   rm -rf "${work:?}"
 }
 trap cleanup EXIT
@@ -28,7 +28,7 @@ auth_json() { grep '^JELLYFIN_ADMIN_PASSWORD=' "${work}/env" | cut -d= -f2- | jq
 hdr='Authorization: MediaBrowser Client="check", Device="check", DeviceId="interrupted-check", Version="1"'
 
 "${engine}" volume create "${name}" >/dev/null
-# Seed: plain Jellyfin (no wrapper) on the new volume, wizard steps up to the
+# Case 1. Seed: plain Jellyfin (no wrapper) on the new volume, wizard steps up to the
 # administrator's password, then SIGKILL. The marker is what the wrapper writes
 # before its first wizard call.
 "${engine}" run -d --name "${name}-seed" --memory 1g --cpus 1 -v "${name}:/data" --entrypoint /jellyfin/jellyfin "${image}" >/dev/null
@@ -40,7 +40,7 @@ in_container "${name}-seed" "curl -fsS -o /dev/null -H '${hdr}' -H 'Content-Type
 auth_json | in_container "${name}-seed" "curl -fsS -o /dev/null -H '${hdr}' -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:8096/Startup/User"
 in_container "${name}-seed" ': > /data/jellyfin/config/railway-bootstrap-network'
 "${engine}" kill -s KILL "${name}-seed" >/dev/null
-"${engine}" rm -f "${name}-seed" >/dev/null
+"${engine}" rm -fv "${name}-seed" >/dev/null
 
 "${engine}" run -d --name "${name}" --memory 1536m --cpus 2 -v "${name}:/data" --env-file "${work}/env" "${image}" >/dev/null
 for _ in $(seq 150); do
@@ -65,3 +65,35 @@ with_token -o /dev/null -X POST http://127.0.0.1:8096/Sessions/Logout
 jq -e '.EnableThrottling==true and .EnableSegmentDeletion==true' <<<"${encoding}" >/dev/null || fail "encoding settings were not applied on resume"
 in_container "${name}" '[ ! -e /data/jellyfin/config/railway-bootstrap-network ] && grep -q "<InternalHttpPort>8096<" /data/jellyfin/config/network.xml' || fail "the marker or the bootstrap port survived"
 echo "interrupted-boot-check: ok an interrupted first boot resumed on loopback and finished libraries, encoding and the port switch"
+
+# Case 2. A stop request while provisioning finishes (the final sync before
+# the marker is removed) must end the container without opening port 8096,
+# and the next boot must resume. A sync that announces itself and sleeps,
+# first on PATH, holds the wrapper in that step.
+"${engine}" rm -fv "${name}" >/dev/null
+printf '#!/bin/sh\necho "fake sync: holding the final provisioning step"\nsleep 20\nexec /usr/bin/sync "$@"\n' > "${work}/sync"
+chmod 0755 "${work}/sync"
+"${engine}" volume create "${name}-term" >/dev/null
+"${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" -v "${work}/sync:/usr/local/bin/sync:ro,Z" --env-file "${work}/env" "${image}" >/dev/null
+for _ in $(seq 150); do
+  "${engine}" logs "${name}-term" 2>&1 | grep -q 'fake sync: holding' && break
+  sleep 2
+done
+"${engine}" logs "${name}-term" 2>&1 | grep -q 'fake sync: holding' || fail "provisioning never reached the final sync"
+"${engine}" kill -s TERM "${name}-term" >/dev/null
+for _ in $(seq 40); do
+  [[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && break
+  sleep 1
+done
+state="$("${engine}" inspect "${name}-term" --format '{{.State.Running}} {{.State.ExitCode}}')"
+[[ "${state}" == "false 143" ]] || fail "TERM during the final step left the container '${state}' (expected stopped with 143)"
+! "${engine}" logs "${name}-term" 2>&1 | grep -q 'Kestrel is listening on all interfaces' || fail "Jellyfin opened its network port after TERM"
+"${engine}" rm -fv "${name}-term" >/dev/null
+"${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" --env-file "${work}/env" "${image}" >/dev/null
+for _ in $(seq 150); do
+  [[ "$(in_container "${name}-term" 'curl -s -m 3 http://127.0.0.1:8096/health' 2>/dev/null)" == Healthy ]] && break
+  sleep 2
+done
+logs="$("${engine}" logs "${name}-term" 2>&1)"
+grep -q 'resuming on 127.0.0.1:18096' <<<"${logs}" && grep -q 'startup wizard completed for admin user admin' <<<"${logs}" || fail "the boot after TERM did not resume and finish provisioning"
+echo "interrupted-boot-check: ok TERM during the final provisioning step stops the container (143) without opening port 8096, and the next boot resumes"

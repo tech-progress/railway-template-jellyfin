@@ -26,9 +26,9 @@ if ! docker info >/dev/null 2>&1; then
 fi
 compose=(docker compose -p "${project}" --env-file "${work}/local.env" -f compose.yaml)
 cleanup() {
-  "${compose[@]}" down --timeout 20 >/dev/null 2>&1 || true
+  "${compose[@]}" down -v --timeout 20 >/dev/null 2>&1 || true
   for id in $("${engine}" ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null); do
-    "${engine}" rm -f "${id}" >/dev/null 2>&1 || true
+    "${engine}" rm -fv "${id}" >/dev/null 2>&1 || true
   done
   "${engine}" volume rm -f "${volume}" >/dev/null 2>&1 || true
   for net in $("${engine}" network ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null); do

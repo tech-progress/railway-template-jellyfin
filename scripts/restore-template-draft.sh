@@ -69,7 +69,11 @@ internal() {
     --config <(printf 'header = "Authorization: Bearer %s"\n' "${token}") -H 'Content-Type: application/json' --data-binary @- <<<"$1"
 }
 request="$(jq -c --arg query 'mutation Update($id:String!,$input:TemplateUpsertConfigInput!){templateUpsertConfig(id:$id,input:$input){id code}}' '{query:$query,variables:.}' <<<"${variables}")"
-internal "${request}" | jq -e '.data.templateUpsertConfig.id != null and ((.errors // []) | length == 0)' >/dev/null
+response="$(internal "${request}")"
+jq -e '.data.templateUpsertConfig.id != null and ((.errors // []) | length == 0)' <<<"${response}" >/dev/null ||
+  { echo "templateUpsertConfig failed: $(jq -r '[.errors[]?.message] | join("; ")' <<<"${response}")" >&2; exit 1; }
 settings="$(jq -nc --arg id "${template_id}" --arg workspaceId "${workspace_id}" --arg name "${name}" --arg query 'mutation Settings($id:String!,$input:TemplateUpsertSettingsInput!){templateUpsertSettings(id:$id,input:$input){id name}}' '{query:$query,variables:{id:$id,input:{name:$name,workspaceId:$workspaceId}}}')"
-internal "${settings}" | jq -e --arg name "${name}" '.data.templateUpsertSettings.name == $name and ((.errors // []) | length == 0)' >/dev/null
+response="$(internal "${settings}")"
+jq -e --arg name "${name}" '.data.templateUpsertSettings.name == $name and ((.errors // []) | length == 0)' <<<"${response}" >/dev/null ||
+  { echo "templateUpsertSettings failed: $(jq -r '[.errors[]?.message] | join("; ")' <<<"${response}")" >&2; exit 1; }
 echo "Restored ${name} draft ${template_id}."
