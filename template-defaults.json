@@ -1,0 +1,16 @@
+{
+  "Jellyfin": {
+    "PORT": "8096",
+    "UPLOAD_PORT": "5001",
+    "JELLYFIN_ADMIN_USERNAME": "admin",
+    "JELLYFIN_ADMIN_PASSWORD": "${{secret(32)}}"
+  },
+  "Jellyfin Gateway": {
+    "PORT": "8080",
+    "GATEWAY_USERNAME": "media-admin",
+    "GATEWAY_PASSWORD": "${{secret(32)}}",
+    "JELLYFIN_UPSTREAM": "${{Jellyfin.RAILWAY_PRIVATE_DOMAIN}}:8096",
+    "UPLOAD_UPSTREAM": "${{Jellyfin.RAILWAY_PRIVATE_DOMAIN}}:5001",
+    "GATEWAY_CONFIG": "{\n  admin off\n}\n:8080 {\n  handle /healthz {\n    rewrite * /health\n    reverse_proxy http://__JELLYFIN__\n  }\n  handle /files* {\n    basic_auth {\n      __USERNAME__ __PASSWORD_HASH__\n    }\n    reverse_proxy http://__UPLOADS__ {\n      header_up -Authorization\n    }\n  }\n  handle {\n    reverse_proxy http://__JELLYFIN__ {\n      header_up X-Forwarded-For {http.request.header.X-Real-IP}\n      header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}\n      header_up X-Forwarded-Host {host}\n      header_up -Forwarded\n    }\n  }\n}"
+  }
+}

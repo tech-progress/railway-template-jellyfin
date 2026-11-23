@@ -1,0 +1,210 @@
+#!/bin/bash
+# Railway wrapper for the official Jellyfin image.
+#
+# Volume layout (one Railway volume mounted at /data):
+#   /data/jellyfin  Jellyfin data, config, logs, metadata and plugins
+#   /data/cache     image cache and transcode segments
+#   /data/media     movies/, shows/ and music/ libraries, written by dufs
+#
+# First boot: Jellyfin starts bound to 127.0.0.1:18096 only, the wrapper
+# completes the startup wizard with JELLYFIN_ADMIN_USERNAME and
+# JELLYFIN_ADMIN_PASSWORD, creates the three libraries, and stops it. Only then
+# does Jellyfin listen on 8096, the port the gateway and Railway's health check
+# use, so the open wizard is never reachable from the network.
+#
+# Every boot: Jellyfin and the private dufs upload server run side by side. If
+# either exits, the other is stopped and the container exits nonzero so
+# Railway's ON_FAILURE restart policy brings the service back.
+set -euo pipefail
+
+data=/data
+jellyfin_data="${data}/jellyfin"
+config_dir="${jellyfin_data}/config"
+cache_dir="${data}/cache"
+media_dir="${data}/media"
+bootstrap_port=18096
+jellyfin_port=8096
+upload_port="${UPLOAD_PORT:-5001}"
+
+fail() { echo "railway-entrypoint: $*" >&2; exit 64; }
+
+[[ "${JELLYFIN_DATA_DIR:-}" == "${jellyfin_data}" && "${JELLYFIN_CONFIG_DIR:-}" == "${config_dir}" && "${JELLYFIN_CACHE_DIR:-}" == "${cache_dir}" ]] ||
+  fail "JELLYFIN_DATA_DIR, JELLYFIN_CONFIG_DIR and JELLYFIN_CACHE_DIR must keep the image defaults under /data."
+[[ "${PORT:-${jellyfin_port}}" == "${jellyfin_port}" ]] || fail "PORT must be ${jellyfin_port}; Jellyfin listens there."
+[[ "${upload_port}" =~ ^[0-9]+$ && "${upload_port}" != "${jellyfin_port}" && "${upload_port}" != "${bootstrap_port}" ]] ||
+  fail "UPLOAD_PORT must be a port number other than ${jellyfin_port} and ${bootstrap_port}."
+
+# The volume root must be a real directory, and nothing the wrapper creates
+# below it may be a symbolic link that leads off the volume.
+[[ -d "${data}" && ! -L "${data}" ]] || fail "${data} must be the mounted volume, not a link."
+for dir in "${jellyfin_data}" "${config_dir}" "${jellyfin_data}/log" "${cache_dir}" "${media_dir}" "${media_dir}/movies" "${media_dir}/shows" "${media_dir}/music"; do
+  [[ ! -L "${dir}" ]] || fail "${dir} is a symbolic link; refusing to follow it off the volume."
+  mkdir -p "${dir}"
+done
+
+wizard_completed() {
+  grep -q '<IsStartupWizardCompleted>true</IsStartupWizardCompleted>' "${config_dir}/system.xml" 2>/dev/null
+}
+
+# network.xml is written only by the bootstrap. Once the wizard is complete the
+# administrator owns it through the dashboard.
+write_network_config() {
+  local port="$1" bind="$2"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>'
+    printf '%s\n' '<NetworkConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">'
+    printf '  <InternalHttpPort>%s</InternalHttpPort>\n  <PublicHttpPort>%s</PublicHttpPort>\n' "${port}" "${port}"
+    # UDP discovery cannot reach a Railway service.
+    printf '%s\n' '  <AutoDiscovery>false</AutoDiscovery>' '  <EnableIPv4>true</EnableIPv4>' '  <EnableIPv6>true</EnableIPv6>' '  <EnableRemoteAccess>true</EnableRemoteAccess>'
+    if [[ "${bind}" == loopback ]]; then
+      printf '%s\n' '  <LocalNetworkAddresses>' '    <string>127.0.0.1</string>' '  </LocalNetworkAddresses>'
+    else
+      printf '%s\n' '  <LocalNetworkAddresses />'
+    fi
+    # The gateway reaches Jellyfin from Railway's private network and replaces
+    # X-Forwarded-For with the client address Railway's edge reports.
+    printf '%s\n' '  <KnownProxies>' '    <string>10.0.0.0/8</string>' '    <string>100.64.0.0/10</string>' '    <string>172.16.0.0/12</string>' '    <string>fd00::/8</string>' '  </KnownProxies>'
+    printf '%s\n' '</NetworkConfiguration>'
+  } >"${config_dir}/network.xml.tmp"
+  mv "${config_dir}/network.xml.tmp" "${config_dir}/network.xml"
+}
+
+start_jellyfin() {
+  # Proxy variables must not capture loopback calls, and the admin password
+  # must not reach Jellyfin, plugins or ffmpeg.
+  env -u JELLYFIN_ADMIN_PASSWORD -u JELLYFIN_ADMIN_USERNAME /jellyfin/jellyfin &
+  jellyfin_pid=$!
+}
+
+stop_pid() {
+  local pid="$1"
+  kill -TERM "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+json_string() {
+  # Escape a value for a JSON string literal. Control characters were refused.
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+bootstrap() {
+  local username="${JELLYFIN_ADMIN_USERNAME:-}" password="${JELLYFIN_ADMIN_PASSWORD:-}"
+  [[ "${username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || fail "JELLYFIN_ADMIN_USERNAME must be 1-64 letters, digits, dot, dash, underscore or @."
+  (( ${#password} >= 16 )) || fail "JELLYFIN_ADMIN_PASSWORD must have at least 16 characters."
+  [[ "${password}" != *[[:cntrl:]]* ]] || fail "JELLYFIN_ADMIN_PASSWORD must not contain control characters."
+
+  local base="http://127.0.0.1:${bootstrap_port}" client='MediaBrowser Client="Railway bootstrap", Device="railway-entrypoint", DeviceId="railway-bootstrap", Version="1.0.0"'
+  local token="" code body
+  # curl reads headers and bodies from descriptors, so neither the password
+  # nor the session token appears in process arguments.
+  call() {
+    local method="$1" path="$2"
+    local header="${client}"
+    [[ -z "${token}" ]] || header+=", Token=\"${token}\""
+    curl --noproxy '*' --silent --show-error --max-time 60 --output /tmp/bootstrap-response --write-out '%{http_code}' \
+      --config <(printf 'header = "Authorization: %s"\n' "${header//\"/\\\"}") \
+      -H 'Content-Type: application/json' -X "${method}" --data-binary @- "${base}${path}"
+  }
+  expect() { [[ "$1" == "$2" ]] || { echo "railway-entrypoint: bootstrap $3 returned HTTP $1" >&2; rm -f /tmp/bootstrap-response; exit 1; }; }
+
+  echo "railway-entrypoint: first boot; running the Jellyfin startup wizard on 127.0.0.1:${bootstrap_port}."
+  write_network_config "${bootstrap_port}" loopback
+  start_jellyfin
+  # Bash as PID 1 ignores TERM without a handler; stop Jellyfin cleanly if
+  # Railway stops the container mid-bootstrap. The next boot starts over.
+  trap 'stop_pid "${jellyfin_pid}"; exit 143' TERM INT
+  # /health answers 200 "Degraded" while the migration server still runs and
+  # the API returns 503, so wait for "Healthy" and the real public info.
+  ready() {
+    [[ "$(curl --noproxy '*' -fsS --max-time 5 "${base}/health" 2>/dev/null)" == Healthy ]] &&
+      curl --noproxy '*' -fsS --max-time 5 "${base}/System/Info/Public" 2>/dev/null | grep -q '"StartupWizardCompleted":false'
+  }
+  for _ in $(seq 300); do
+    ready && break
+    kill -0 "${jellyfin_pid}" 2>/dev/null || { echo "railway-entrypoint: Jellyfin exited during bootstrap." >&2; exit 1; }
+    sleep 2
+  done
+  ready || { echo "railway-entrypoint: Jellyfin did not become ready within 10 minutes." >&2; exit 1; }
+
+  code="$(printf '%s' '{"ServerName":"Media Server","UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' | call POST /Startup/Configuration)"
+  expect "${code}" 204 "server configuration"
+  # GET /Startup/User creates the initial user if none exists yet.
+  code="$(printf '' | call GET /Startup/User)"
+  expect "${code}" 200 "initial user lookup"
+  code="$(printf '{"Name":%s,"Password":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Startup/User)"
+  # 403 means an earlier, interrupted bootstrap already set the password; the
+  # sign-in below proves it is this deployment's password before going on.
+  [[ "${code}" == 204 || "${code}" == 403 ]] || expect "${code}" 204 "admin account"
+
+  code="$(printf '{"Username":%s,"Pw":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Users/AuthenticateByName)"
+  expect "${code}" 200 "admin sign-in"
+  token="$(sed -n 's/.*"AccessToken":"\([0-9a-fA-F]*\)".*/\1/p' /tmp/bootstrap-response)"
+  [[ -n "${token}" ]] || { echo "railway-entrypoint: admin sign-in returned no token." >&2; exit 1; }
+
+  code="$(printf '' | call GET /Library/VirtualFolders)"
+  expect "${code}" 200 "library list"
+  body="$(cat /tmp/bootstrap-response)"
+  local library name collection path
+  for library in "Movies:movies:${media_dir}/movies" "Shows:tvshows:${media_dir}/shows" "Music:music:${media_dir}/music"; do
+    IFS=: read -r name collection path <<<"${library}"
+    grep -q "\"Name\":\"${name}\"" <<<"${body}" && continue
+    code="$(printf '{"LibraryOptions":{"EnableRealtimeMonitor":true,"PathInfos":[{"Path":"%s"}]}}' "${path}" |
+      call POST "/Library/VirtualFolders?name=${name}&collectionType=${collection}&refreshLibrary=false")"
+    expect "${code}" 204 "library ${name}"
+  done
+
+  # Software transcoding on shared CPUs: pause ffmpeg once the client has
+  # enough buffer and delete played segments so transcodes do not fill the volume.
+  code="$(printf '' | call GET /System/Configuration/encoding)"
+  expect "${code}" 200 "encoding settings"
+  body="$(sed -e 's/"EnableThrottling":false/"EnableThrottling":true/' -e 's/"EnableSegmentDeletion":false/"EnableSegmentDeletion":true/' /tmp/bootstrap-response)"
+  code="$(printf '%s' "${body}" | call POST /System/Configuration/encoding)"
+  expect "${code}" 204 "encoding update"
+
+  code="$(printf '' | call POST /Startup/Complete)"
+  expect "${code}" 204 "wizard completion"
+  code="$(printf '' | call POST /Sessions/Logout)"
+  expect "${code}" 204 "bootstrap sign-out"
+  token=""
+  rm -f /tmp/bootstrap-response
+
+  stop_pid "${jellyfin_pid}"
+  wizard_completed || { echo "railway-entrypoint: Jellyfin did not record the completed wizard." >&2; exit 1; }
+  write_network_config "${jellyfin_port}" all
+  echo "railway-entrypoint: startup wizard completed for admin user ${username}; libraries Movies, Shows and Music created."
+}
+
+if ! wizard_completed; then
+  bootstrap
+fi
+unset JELLYFIN_ADMIN_PASSWORD
+
+dufs "${media_dir}" \
+  --bind 0.0.0.0 --bind :: \
+  --port "${upload_port}" \
+  --path-prefix files \
+  --allow-upload --allow-delete --allow-search --allow-archive \
+  --hidden '.*' &
+dufs_pid=$!
+
+start_jellyfin
+
+stopping=0
+stop() {
+  kill -TERM "${jellyfin_pid}" "${dufs_pid}" 2>/dev/null || true
+}
+trap 'stopping=1; stop' TERM INT
+
+status=0
+wait -n "${jellyfin_pid}" "${dufs_pid}" || status=$?
+stop
+wait "${jellyfin_pid}" 2>/dev/null || true
+wait "${dufs_pid}" 2>/dev/null || true
+if (( stopping )); then
+  exit 0
+fi
+echo "railway-entrypoint: a Jellyfin service process exited unexpectedly (status ${status}); stopping the container." >&2
+exit $(( status == 0 ? 1 : status ))

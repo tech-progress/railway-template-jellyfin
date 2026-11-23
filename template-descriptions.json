@@ -1,0 +1,16 @@
+{
+  "Jellyfin": {
+    "PORT": "Jellyfin web and API listener used by Railway health checks. Must stay 8096.",
+    "UPLOAD_PORT": "Private dufs upload server listener reached only through the gateway at /files/.",
+    "JELLYFIN_ADMIN_USERNAME": "Jellyfin administrator created on first boot. Changing it later has no effect.",
+    "JELLYFIN_ADMIN_PASSWORD": "Generated password of the first-boot Jellyfin administrator. Change it in Jellyfin afterwards; editing this variable later has no effect."
+  },
+  "Jellyfin Gateway": {
+    "PORT": "Public gateway listener.",
+    "GATEWAY_USERNAME": "Username for the /files/ upload manager.",
+    "GATEWAY_PASSWORD": "Generated password for the /files/ upload manager (16 to 72 bytes).",
+    "JELLYFIN_UPSTREAM": "Private Jellyfin web and API endpoint.",
+    "UPLOAD_UPSTREAM": "Private media upload endpoint.",
+    "GATEWAY_CONFIG": "Pinned Caddy policy: Basic Auth on /files/, Jellyfin's own login everywhere else."
+  }
+}

@@ -1,0 +1,65 @@
+name: jellyfin-media-server-local
+# Local mirror of the Railway topology: Jellyfin (private, one volume at /data)
+# and the Caddy gateway (the only published port). Memory and CPU limits keep
+# the stack small on shared machines.
+services:
+  jellyfin:
+    build: .
+    image: jellyfin-media-server:local
+    environment:
+      PORT: "8096"
+      UPLOAD_PORT: "5001"
+      JELLYFIN_ADMIN_USERNAME: ${JELLYFIN_ADMIN_USERNAME:-admin}
+      JELLYFIN_ADMIN_PASSWORD: ${JELLYFIN_ADMIN_PASSWORD:?Set JELLYFIN_ADMIN_PASSWORD}
+    volumes: ["jellyfin-data:/data"]
+    mem_limit: 1536m
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8096/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+  gateway:
+    image: caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee
+    entrypoint: ["/bin/sh", "-ec"]
+    # Identical to GATEWAY_START in .railway/railway.ts ($$ escapes Compose interpolation).
+    command:
+      - "case \"$$GATEWAY_USERNAME\" in \"\"|*[!A-Za-z0-9._-]*) echo \"GATEWAY_USERNAME must use letters, digits, dot, dash or underscore.\" >&2; exit 64;; esac; [ \"$$(printf \"%s\" \"$$GATEWAY_PASSWORD\" | wc -c)\" -ge 16 ] && [ \"$$(printf \"%s\" \"$$GATEWAY_PASSWORD\" | wc -c)\" -le 72 ] || { echo \"GATEWAY_PASSWORD must have 16 to 72 bytes.\" >&2; exit 64; }; password_hash=\"$$(printf \"%s\" \"$$GATEWAY_PASSWORD\" | caddy hash-password)\"; unset GATEWAY_PASSWORD; printf \"%s\\n\" \"$$GATEWAY_CONFIG\" | sed -e \"s|__USERNAME__|$$GATEWAY_USERNAME|g\" -e \"s|__PASSWORD_HASH__|$$password_hash|g\" -e \"s|__JELLYFIN__|$$JELLYFIN_UPSTREAM|g\" -e \"s|__UPLOADS__|$$UPLOAD_UPSTREAM|g\" >/tmp/Caddyfile; unset GATEWAY_CONFIG; echo \"Waiting for Jellyfin to complete its startup wizard.\"; until wget -Y off -q -T 5 -O - \"http://$$JELLYFIN_UPSTREAM/System/Info/Public\" 2>/dev/null | grep -q \"\\\"StartupWizardCompleted\\\":true\"; do sleep 2; done; exec caddy run --config /tmp/Caddyfile --adapter caddyfile"
+    environment:
+      GATEWAY_USERNAME: ${GATEWAY_USERNAME:-media-admin}
+      GATEWAY_PASSWORD: ${GATEWAY_PASSWORD:?Set GATEWAY_PASSWORD}
+      JELLYFIN_UPSTREAM: jellyfin:8096
+      UPLOAD_UPSTREAM: jellyfin:5001
+      GATEWAY_CONFIG: |
+        {
+          admin off
+        }
+        :8080 {
+          handle /healthz {
+            rewrite * /health
+            reverse_proxy http://__JELLYFIN__
+          }
+          handle /files* {
+            basic_auth {
+              __USERNAME__ __PASSWORD_HASH__
+            }
+            reverse_proxy http://__UPLOADS__ {
+              header_up -Authorization
+            }
+          }
+          handle {
+            reverse_proxy http://__JELLYFIN__ {
+              header_up X-Forwarded-For {http.request.header.X-Real-IP}
+              header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+              header_up X-Forwarded-Host {host}
+              header_up -Forwarded
+            }
+          }
+        }
+    ports: ["127.0.0.1:${JELLYFIN_LOCAL_PORT:-13096}:8080"]
+    mem_limit: 128m
+    cpus: 0.5
+    depends_on: [jellyfin]
+volumes:
+  jellyfin-data:
+    name: ${JELLYFIN_VOLUME:-jellyfin-media-server-local-data}

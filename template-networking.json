@@ -1,0 +1,5 @@
+{
+  "Jellyfin Gateway": {
+    "publicPort": 8080
+  }
+}
