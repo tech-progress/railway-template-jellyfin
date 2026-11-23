@@ -88,10 +88,29 @@ start_jellyfin() {
   jellyfin_pid=$!
 }
 
-stop_pid() {
-  local pid="$1"
-  kill -TERM "${pid}" 2>/dev/null || true
-  wait "${pid}" 2>/dev/null || true
+child_alive() {
+  # A child that exited but is not yet reaped is a zombie (state Z).
+  [[ -r "/proc/$1/stat" ]] && [[ "$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1)" != Z ]]
+}
+
+# Stop children within a bounded time. Jellyfin ignores TERM in its first
+# seconds, before its host has registered a handler, so TERM is repeated every
+# second and anything still running after 20 seconds gets KILL.
+stop_children() {
+  local pid alive=0 deadline=$((SECONDS + 20))
+  kill -TERM "$@" 2>/dev/null || true
+  while (( SECONDS < deadline )); do
+    alive=0
+    for pid in "$@"; do child_alive "${pid}" && alive=1; done
+    (( alive )) || break
+    sleep 1
+    kill -TERM "$@" 2>/dev/null || true
+  done
+  if (( alive )); then
+    echo "railway-entrypoint: a child ignored TERM for 20 seconds; sending KILL." >&2
+    kill -KILL "$@" 2>/dev/null || true
+  fi
+  for pid in "$@"; do wait "${pid}" 2>/dev/null || true; done
 }
 
 json_string() {
@@ -142,7 +161,7 @@ provision() {
   # Bash as PID 1 ignores TERM without a handler; stop Jellyfin cleanly if
   # Railway stops the container mid-provisioning. The marker makes the next
   # boot resume.
-  trap 'stop_pid "${jellyfin_pid}"; exit 143' TERM INT
+  trap 'stop_children "${jellyfin_pid}"; exit 143' TERM INT
   # /health answers 200 "Degraded" while the migration server still runs and
   # the API returns 503, so wait for "Healthy" and the real public info.
   ready() {
@@ -207,7 +226,7 @@ provision() {
   token=""
   rm -f /tmp/bootstrap-response
 
-  stop_pid "${jellyfin_pid}"
+  stop_children "${jellyfin_pid}"
   trap 'exit 143' TERM INT
   wizard_completed || { echo "railway-entrypoint: Jellyfin did not record the completed wizard." >&2; exit 1; }
   finish_network_config
@@ -248,11 +267,16 @@ start_jellyfin
 # A stop that arrived while the children were starting.
 (( stopping == 0 )) || stop
 
+# Poll instead of `wait -n`: a stop request that lands just before a blocking
+# wait would otherwise wait for a child that is still ignoring TERM.
 status=0
-wait -n "${jellyfin_pid}" "${dufs_pid}" || status=$?
-stop
-wait "${jellyfin_pid}" 2>/dev/null || true
-wait "${dufs_pid}" 2>/dev/null || true
+while (( stopping == 0 )); do
+  if ! child_alive "${jellyfin_pid}"; then wait "${jellyfin_pid}" || status=$?; break; fi
+  if ! child_alive "${dufs_pid}"; then wait "${dufs_pid}" || status=$?; break; fi
+  sleep 1 &
+  wait "$!" || true
+done
+stop_children "${jellyfin_pid}" "${dufs_pid}"
 if (( stopping )); then
   exit 0
 fi

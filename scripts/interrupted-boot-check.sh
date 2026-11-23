@@ -97,3 +97,27 @@ done
 logs="$("${engine}" logs "${name}-term" 2>&1)"
 grep -q 'resuming on 127.0.0.1:18096' <<<"${logs}" && grep -q 'startup wizard completed for admin user admin' <<<"${logs}" || fail "the boot after TERM did not resume and finish provisioning"
 echo "interrupted-boot-check: ok TERM during the final provisioning step stops the container (143) without opening port 8096, and the next boot resumes"
+
+# Case 3. TERM one second after start, while Jellyfin is still starting (it
+# ignores TERM until its host is up), must stop the container within 30
+# seconds: on the provisioned volume from case 2 and on a fresh volume.
+term_early() {
+  local label="$1" state=""
+  sleep 1
+  "${engine}" kill -s TERM "${name}-term" >/dev/null
+  for _ in $(seq 30); do
+    state="$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')"
+    [[ "${state}" == false ]] && break
+    sleep 1
+  done
+  [[ "${state}" == false ]] || fail "TERM one second after start left the container running (${label})"
+  echo "interrupted-boot-check: ok TERM one second after start stopped the container (${label}, exit $("${engine}" inspect "${name}-term" --format '{{.State.ExitCode}}'))"
+}
+"${engine}" stop -t 30 "${name}-term" >/dev/null
+"${engine}" start "${name}-term" >/dev/null
+term_early "provisioned volume"
+"${engine}" rm -fv "${name}-term" >/dev/null
+"${engine}" volume rm -f "${name}-term" >/dev/null
+"${engine}" volume create "${name}-term" >/dev/null
+"${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" --env-file "${work}/env" "${image}" >/dev/null
+term_early "fresh volume"
