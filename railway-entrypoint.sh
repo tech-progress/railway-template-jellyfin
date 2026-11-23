@@ -159,11 +159,15 @@ provision() {
   call() {
     local method="$1" path="$2" body="${3:-}" header="${client}"
     [[ -z "${token}" ]] || header+=", Token=\"${token}\""
+    local rc=0
     code=000
     bg_curl --silent --show-error --max-time 60 --output /tmp/bootstrap-response --write-out '%{http_code}' \
       --config <(printf 'header = "Authorization: %s"\n' "${header//\"/\\\"}") \
-      -H 'Content-Type: application/json' -X "${method}" --data-binary @<(printf '%s' "${body}") "${base}${path}" >/tmp/bootstrap-code || true
+      -H 'Content-Type: application/json' -X "${method}" --data-binary @<(printf '%s' "${body}") "${base}${path}" >/tmp/bootstrap-code || rc=$?
     read -r code </tmp/bootstrap-code || true
+    # A transfer curl reports as failed (for example a truncated body) never
+    # counts, whatever HTTP status it recorded.
+    (( rc == 0 )) || code="curl-exit-${rc}"
   }
   expect() { [[ "$1" == "$2" ]] || { echo "railway-entrypoint: provisioning $3 returned HTTP $1" >&2; rm -f /tmp/bootstrap-response; exit 1; }; }
 
@@ -178,7 +182,7 @@ provision() {
   # Bash as PID 1 ignores TERM without a handler; stop Jellyfin cleanly if
   # Railway stops the container mid-provisioning. The marker makes the next
   # boot resume.
-  trap '[[ -z "${curl_pid}" ]] || kill "${curl_pid}" 2>/dev/null; stop_children "${jellyfin_pid}"; exit 143' TERM INT
+  trap '[[ -z "${curl_pid}" ]] || kill "${curl_pid}" 2>/dev/null || true; stop_children "${jellyfin_pid}"; exit 143' TERM INT
   # /health answers 200 "Degraded" while the migration server still runs and
   # the API returns 503, so wait for "Healthy" and the real public info.
   ready() {

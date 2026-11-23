@@ -104,7 +104,8 @@ echo "interrupted-boot-check: ok TERM during the final provisioning step stops t
 # ignores TERM until its host is up), must stop the container within 30
 # seconds: on the provisioned volume from case 2 and on a fresh volume.
 term_early() {
-  local label="$1" state=""
+  # $2: exit codes that mean a deliberate stop at this point.
+  local label="$1" allowed="$2" state="" code=""
   sleep 1
   "${engine}" kill -s TERM "${name}-term" >/dev/null
   for _ in $(seq 30); do
@@ -113,16 +114,19 @@ term_early() {
     sleep 1
   done
   [[ "${state}" == false ]] || fail "TERM one second after start left the container running (${label})"
-  echo "interrupted-boot-check: ok TERM one second after start stopped the container (${label}, exit $("${engine}" inspect "${name}-term" --format '{{.State.ExitCode}}'))"
+  code="$("${engine}" inspect "${name}-term" --format '{{.State.ExitCode}}')"
+  [[ " ${allowed} " == *" ${code} "* ]] || fail "TERM one second after start exited ${code} (${label}; expected one of: ${allowed})"
+  echo "interrupted-boot-check: ok TERM one second after start stopped the container (${label}, exit ${code})"
 }
 "${engine}" stop -t 30 "${name}-term" >/dev/null
 "${engine}" start "${name}-term" >/dev/null
-term_early "provisioned volume"
+# Provisioned: exit 0 from supervision, or 143 if TERM landed before the re-exec.
+term_early "provisioned volume" "0 143"
 "${engine}" rm -fv "${name}-term" >/dev/null
 "${engine}" volume rm -f "${name}-term" >/dev/null
 "${engine}" volume create "${name}-term" >/dev/null
 "${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" --env-file "${work}/env" "${image}" >/dev/null
-term_early "fresh volume"
+term_early "fresh volume" "143"
 
 # Case 4. TERM while a provisioning request is in flight. A curl first on PATH
 # that stalls the /Startup/Configuration request for 50 seconds stands in for
@@ -144,6 +148,28 @@ for _ in $(seq 40); do
   [[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && break
   sleep 1
 done
-[[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && (( SECONDS - started <= 25 )) ||
-  fail "TERM during a provisioning request took $((SECONDS - started))s or more to stop the container"
+[[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}} {{.State.ExitCode}}')" == "false 143" ]] && (( SECONDS - started <= 25 )) ||
+  fail "TERM during a provisioning request: '$("${engine}" inspect "${name}-term" --format '{{.State.Running}} {{.State.ExitCode}}')' after $((SECONDS - started))s (expected stopped with 143 within 25s)"
 echo "interrupted-boot-check: ok TERM during a stalled provisioning request stopped the container in $((SECONDS - started))s (exit $("${engine}" inspect "${name}-term" --format '{{.State.ExitCode}}'))"
+
+# Case 5. A transfer curl reports as failed must not count, even with the
+# expected HTTP status: a curl first on PATH completes the sign-in request and
+# then exits 18 (partial transfer). Provisioning must stop with an error, keep
+# the marker and never open port 8096.
+"${engine}" rm -fv "${name}-term" >/dev/null
+"${engine}" volume rm -f "${name}-term" >/dev/null
+printf '#!/bin/sh\ncase "$*" in *AuthenticateByName*) /usr/bin/curl "$@"; echo "fake curl: reporting a partial sign-in transfer" >&2; exit 18;; esac\nexec /usr/bin/curl "$@"\n' > "${work}/curl"
+chmod 0755 "${work}/curl"
+"${engine}" volume create "${name}-term" >/dev/null
+"${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" -v "${work}/curl:/usr/local/bin/curl:ro,Z" --env-file "${work}/env" "${image}" >/dev/null
+for _ in $(seq 150); do
+  [[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && break
+  sleep 2
+done
+state="$("${engine}" inspect "${name}-term" --format '{{.State.Running}} {{.State.ExitCode}}')"
+logs="$("${engine}" logs "${name}-term" 2>&1)"
+[[ "${state}" == "false 1" ]] && grep -q 'fake curl: reporting a partial sign-in transfer' <<<"${logs}" && grep -q 'admin sign-in returned HTTP curl-exit-18' <<<"${logs}" ||
+  fail "a failed sign-in transfer did not stop provisioning (state '${state}')"
+! grep -q 'Kestrel is listening on all interfaces' <<<"${logs}" || fail "Jellyfin opened its network port after a failed transfer"
+"${engine}" run --rm -v "${name}-term:/data" --entrypoint /bin/sh "${image}" -c 'test -e /data/jellyfin/config/railway-bootstrap-network' || fail "the marker was removed after a failed transfer"
+echo "interrupted-boot-check: ok a failed curl transfer with HTTP 200 stops provisioning (exit 1), keeps the marker and never opens port 8096"
