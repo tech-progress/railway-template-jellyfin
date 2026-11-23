@@ -67,11 +67,12 @@ in_container "${name}" '[ ! -e /data/jellyfin/config/railway-bootstrap-network ]
 echo "interrupted-boot-check: ok an interrupted first boot resumed on loopback and finished libraries, encoding and the port switch"
 
 # Case 2. A stop request while provisioning finishes (the final sync before
-# the marker is removed) must end the container without opening port 8096,
+# the marker is removed, stalled here for 50 seconds) must end the container
+# within 25 seconds without opening port 8096,
 # and the next boot must resume. A sync that announces itself and sleeps,
 # first on PATH, holds the wrapper in that step.
 "${engine}" rm -fv "${name}" >/dev/null
-printf '#!/bin/sh\necho "fake sync: holding the final provisioning step"\nsleep 20\nexec /usr/bin/sync "$@"\n' > "${work}/sync"
+printf '#!/bin/sh\necho "fake sync: holding the final provisioning step"\nsleep 50\nexec /usr/bin/sync "$@"\n' > "${work}/sync"
 chmod 0755 "${work}/sync"
 "${engine}" volume create "${name}-term" >/dev/null
 "${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" -v "${work}/sync:/usr/local/bin/sync:ro,Z" --env-file "${work}/env" "${image}" >/dev/null
@@ -80,13 +81,14 @@ for _ in $(seq 150); do
   sleep 2
 done
 "${engine}" logs "${name}-term" 2>&1 | grep -q 'fake sync: holding' || fail "provisioning never reached the final sync"
+started=${SECONDS}
 "${engine}" kill -s TERM "${name}-term" >/dev/null
-for _ in $(seq 40); do
+for _ in $(seq 25); do
   [[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && break
   sleep 1
 done
 state="$("${engine}" inspect "${name}-term" --format '{{.State.Running}} {{.State.ExitCode}}')"
-[[ "${state}" == "false 143" ]] || fail "TERM during the final step left the container '${state}' (expected stopped with 143)"
+[[ "${state}" == "false 143" ]] || fail "TERM during the 50-second final sync left the container '${state}' after $((SECONDS - started))s (expected stopped with 143 within 25s)"
 ! "${engine}" logs "${name}-term" 2>&1 | grep -q 'Kestrel is listening on all interfaces' || fail "Jellyfin opened its network port after TERM"
 "${engine}" rm -fv "${name}-term" >/dev/null
 "${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" --env-file "${work}/env" "${image}" >/dev/null

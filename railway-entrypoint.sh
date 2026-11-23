@@ -78,7 +78,10 @@ write_network_config() {
 
 finish_network_config() {
   write_network_config "${jellyfin_port}" all
-  sync
+  # Awaited with the wait builtin so a stop request is not held until sync
+  # ends; an interrupted sync leaves the marker, and the next boot resumes.
+  sync &
+  wait "$!"
   rm -f "${bootstrap_marker:?}"
 }
 
