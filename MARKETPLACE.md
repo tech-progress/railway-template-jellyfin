@@ -17,7 +17,7 @@ Railway has no GPUs, so transcoding is software ffmpeg. Plan on about two vCPU p
 - No first-visit takeover: the setup wizard is finished with a generated administrator before the public port opens.
 - Upload movies, shows and music from a browser instead of copying files to a server.
 - Pinned image digests for Jellyfin, dufs and Caddy, health checks, and a persistent volume.
-- Transcode throttling and segment deletion are on, so transcodes do not fill the volume.
+- Transcode throttling and segment deletion are on, which limits CPU use and the space long transcodes take.
 
 ## Common Use Cases
 

@@ -21,7 +21,7 @@ expected_services="$(jq -r '[.graph.resources[] | select(.type == "service") | .
 expected_services_json="$(jq -c '[.graph.resources[] | select(.type == "service") | .name] | sort' <<<"${graph}")"
 # Shape: an ID-keyed services object, no other resources, no buckets.
 jq -e '.data.template.serializedConfig | type == "object" and (.services | type) == "object"
-  and ((keys - ["buckets", "services"]) == []) and ((.buckets // {}) | type == "object" and length == 0)' <<<"${template}" >/dev/null \
+  and ((keys - ["buckets", "services"]) == []) and ((has("buckets") | not) or .buckets == {}) and all(.services | keys[]; length > 0)' <<<"${template}" >/dev/null \
   || fail "graph shape or unexpected top-level resources"
 [[ "$(jq -c '.data.template.serializedConfig.services | map(.name) | sort' <<<"${template}")" == "${expected_services_json}" ]] || fail "service set"
 [[ "${expected_services_json}" == '["Jellyfin","Jellyfin Gateway"]' ]] || fail "IaC service set"

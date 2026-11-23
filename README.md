@@ -19,7 +19,7 @@ One 5 GB volume is mounted at `/data` on the Jellyfin service:
 
 ### No open setup wizard
 
-A fresh Jellyfin lets whoever opens it first run the setup wizard and create the administrator. In this template the Jellyfin container runs the wizard itself on first boot, while Jellyfin listens only on `127.0.0.1:18096` inside the container. It creates the administrator `JELLYFIN_ADMIN_USERNAME` with the generated `JELLYFIN_ADMIN_PASSWORD`, adds the Movies, Shows and Music libraries, turns on transcode throttling and segment deletion, and marks the wizard complete. Only then does Jellyfin listen on port 8096, and the gateway opens only after Jellyfin reports the completed wizard. After that, Jellyfin's setup API requires an administrator login.
+A fresh Jellyfin lets whoever opens it first run the setup wizard and create the administrator. In this template the Jellyfin container runs the wizard itself on first boot, while Jellyfin listens only on `127.0.0.1:18096` inside the container. It creates the administrator `JELLYFIN_ADMIN_USERNAME` with the generated `JELLYFIN_ADMIN_PASSWORD`, adds the Movies, Shows and Music libraries, turns on transcode throttling and segment deletion, and marks the wizard complete. Only then does Jellyfin listen on port 8096, and the gateway opens only after Jellyfin reports the completed wizard. After that, Jellyfin's setup API requires an administrator login. If the container stops partway through, a marker on the volume makes the next boot resume the same steps on loopback, signed in as the generated administrator, before port 8096 opens.
 
 ## Deploy on Railway
 
@@ -61,9 +61,9 @@ Railway has no GPUs, so every transcode is software ffmpeg on the Jellyfin servi
 
 - A 1080p to 720p H.264 transcode of a synthetic test clip ran at 1.5 times real time on one CPU and 3.6 times on two (`libx264 veryfast`, the same ffmpeg build). Real films are harder to encode than test patterns, so plan on about two vCPU per simultaneous 1080p transcode.
 - 4K and HEVC sources, HDR tone mapping and burned-in subtitles cost several times more. Prefer direct play, or keep 1080p H.264 copies, for those.
-- Jellyfin itself idles at roughly 200 to 450 MB; each ffmpeg transcode adds a few hundred MB. Library scans of large collections use extra CPU and memory while they run.
+- Jellyfin itself used 216 to 426 MB on Railway around the smoke test. Each ffmpeg transcode adds its own memory: a 1080p H.264 encode peaked at about 470 MB with eight encoder threads (ffmpeg's choice for the 8 vCPU Railway shows) and about 300 MB with two. Library scans of large collections use extra CPU and memory while they run.
 - The image sets `DOTNET_gcServer=0` (workstation garbage collection) so the .NET runtime does not size its heap to the 8 vCPU and 8 GB Railway shows every container.
-- The first boot turns on transcode throttling (ffmpeg pauses once the player has enough buffer) and segment deletion (played segments are removed), so a long transcode does not fill the volume.
+- The first boot turns on transcode throttling (ffmpeg pauses once the player has enough buffer) and segment deletion (Jellyfin removes already-played segments of long HLS transcodes). Transcodes still write temporary segments to `/data/cache/transcodes`, so leave free space on the volume.
 
 To cap cost, set Railway's CPU and memory limits on the `Jellyfin` service, and in Jellyfin's Dashboard, Playback, Transcoding set a thread count and in each user's settings a maximum streaming bitrate. Every byte streamed to viewers is Railway egress, which is billed by the GB, and direct-play streams of large files add up quickly.
 
@@ -85,7 +85,7 @@ bun install --frozen-lockfile
 ./scripts/local-check.sh
 ```
 
-`local-check.sh` generates passwords into a private file, builds the image without cache, starts Compose from an empty volume, proves the wizard ran on loopback before Jellyfin listened on the network, runs `SMOKE_PHASE=initial ./scripts/smoke.sh`, restarts and recreates Jellyfin and restarts the gateway with `SMOKE_PHASE=restart` after each, scans logs and process environments for the passwords, and removes everything it created. Without a Docker daemon it starts a private podman API socket for the run.
+`local-check.sh` generates passwords into a private file, builds the image without cache, starts Compose from an empty volume, proves the wizard ran on loopback before Jellyfin listened on the network, runs `SMOKE_PHASE=initial ./scripts/smoke.sh`, restarts and recreates Jellyfin and restarts the gateway with `SMOKE_PHASE=restart` after each, injects a crash after the wizard completed and requires the next boot to resume provisioning, checks that the gateway's error log redacts tokens, scans logs, stored files and process environments (the wrapper's PID 1 included) for the passwords, runs `scripts/interrupted-boot-check.sh` (an administrator created, then the container killed before provisioning finished), and removes everything it created. Without a Docker daemon it starts a private podman API socket for the run.
 
 The smoke test checks that the wizard is closed and Jellyfin's private APIs refuse anonymous calls, that `/files/` refuses anonymous and wrong-password requests, signs in with the generated administrator, uploads a short video through `/files/`, runs a library scan until the video appears as a movie, compares direct play byte for byte with the upload, and transcodes it to 320-pixel H.264. Set `BASE_URL`, `GATEWAY_PASSWORD` and `JELLYFIN_ADMIN_PASSWORD` to run it against a Railway deployment; over HTTPS it also requires that Jellyfin sees the visitor's public address. It needs `curl`, `jq`, `ffmpeg` and `ffprobe`.
 

@@ -25,7 +25,8 @@ variables="$(jq -c --argjson desired "${desired}" \
   .data.template.serializedConfig as $config
   | if ($config | type) != "object" or ($config.services | type) != "object" then error("Draft services must be an object keyed by ID")
     elif (($config | keys) - ["buckets", "services"]) != [] then error("Draft has unexpected top-level resources")
-    elif (($config.buckets // {}) | length) != 0 then error("Draft has buckets")
+    elif ($config | has("buckets")) and $config.buckets != {} then error("Draft has buckets")
+    elif any($config.services | keys[]; length == 0) then error("Draft has an empty service ID")
     elif (($config.services | map(.name) | sort) != ($desired | keys | sort)) then error("Draft service set mismatch")
     elif ([$config.services[] | (.volumeMounts // {}) | if type == "object" then keys[] else "" end] as $ids
           | any($ids[]; length == 0) or ($ids | length) != ($ids | unique | length)) then error("Draft volume mount IDs must be nonempty and unique")

@@ -62,6 +62,9 @@ mutate "a gateway sharing the Jellyfin volume" "${G} | .services[\$g].volumeMoun
 mutate "a third service" '.services.extra = (.services|to_entries[0].value|.name="Extra")'
 mutate "a duplicated service name" "${G} | .services[\$g].name = \"Jellyfin\""
 mutate "a bucket" '.buckets = {"b": {}}'
+mutate "null buckets" '.buckets = null'
+mutate "false buckets" '.buckets = false'
+mutate "an empty service ID" '.services |= with_entries(if .value.name == "Jellyfin Gateway" then .key = "" else . end)'
 # Restore round trip: a generated draft with a seed image on Jellyfin, a stray
 # custom domain, two replicas, stripped defaults and a stored value is restored
 # through stubbed APIs, and the restored config must pass the audit.

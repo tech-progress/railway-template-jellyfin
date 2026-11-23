@@ -34,7 +34,7 @@ cleanup() {
   for net in $("${engine}" network ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null); do
     "${engine}" network rm -f "${net}" >/dev/null 2>&1 || true
   done
-  [[ -n "${KEEP_IMAGE:-}" ]] || "${engine}" rmi -f jellyfin-media-server:local >/dev/null 2>&1 || true
+  [[ -n "${KEEP_IMAGE:-}" ]] || "${engine}" rmi -f docker.io/library/jellyfin-media-server:local >/dev/null 2>&1 || true
   if [[ -n "${service_pid}" ]]; then kill "${service_pid}" 2>/dev/null || true; wait "${service_pid}" 2>/dev/null || true; fi
   rm -rf "${work:?}"
 }
@@ -97,26 +97,53 @@ jellyfin_id="$(container jellyfin)"
 "${engine}" stop -t 30 "${gateway_id}" >/dev/null && "${engine}" start "${gateway_id}" >/dev/null
 wait_healthy; smoke restart
 
+# Crash after Jellyfin recorded the completed wizard but before provisioning
+# finished: the volume has the loopback network.xml and the marker. The next
+# boot must resume provisioning on loopback and then reopen port 8096.
+"${engine}" exec "${jellyfin_id}" sh -ec 'c=/data/jellyfin/config; sed -e "s|<InternalHttpPort>8096<|<InternalHttpPort>18096<|" -e "s|<PublicHttpPort>8096<|<PublicHttpPort>18096<|" -e "s|<LocalNetworkAddresses />|<LocalNetworkAddresses><string>127.0.0.1</string></LocalNetworkAddresses>|" "$c/network.xml" > "$c/network.xml.new"; mv "$c/network.xml.new" "$c/network.xml"; grep -q "<InternalHttpPort>18096<" "$c/network.xml"; : > "$c/railway-bootstrap-network"'
+"${engine}" stop -t 30 "${jellyfin_id}" >/dev/null && "${engine}" start "${jellyfin_id}" >/dev/null
+wait_healthy; smoke restart
+[[ "$(count jellyfin 'an earlier first boot stopped before provisioning finished')" == 1 ]] || fail "no resume marker after the injected crash"
+"${engine}" exec "${jellyfin_id}" sh -c '[ ! -e /data/jellyfin/config/railway-bootstrap-network ] && grep -q "<InternalHttpPort>8096<" /data/jellyfin/config/network.xml' || fail "the recovery left the marker or the bootstrap port"
+echo "local-check: ok a crash after wizard completion resumes provisioning and reopens port 8096"
+
 "${engine}" stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' "${jellyfin_id}" "${gateway_id}"
 
-# No credential in any log, in the Jellyfin process environment, or in Caddy's.
+# Gateway error log with Jellyfin down: a token in ?api_key=, Referer and the
+# X-Emby-Token header must not reach the log.
+"${engine}" stop -t 30 "${jellyfin_id}" >/dev/null
+marker="logprobe$(gen 24)"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H "Referer: https://example.com/?api_key=${marker}" -H "X-Emby-Token: ${marker}" "${BASE_URL}/Items?api_key=${marker}")"
+[[ "${code}" == 502 ]] || fail "the probe with Jellyfin stopped returned ${code}, expected 502"
+log_of gateway > "${work}/gateway-probe.log"
+grep -qF '"uri":"/Items?[redacted]"' "${work}/gateway-probe.log" && ! grep -qF "${marker}" "${work}/gateway-probe.log" || fail "the gateway error log holds the probe token (or did not log the probe)"
+"${engine}" start "${jellyfin_id}" >/dev/null; wait_healthy
+echo "local-check: ok the gateway error log redacts query tokens, Referer and X-Emby-Token"
+
+# No credential in any log, in Jellyfin's stored files, in any long-lived
+# process environment (PID 1 included). Patterns come from a 0600 file or
+# stdin, never from process arguments.
+( umask 077; printf '%s\n' "${GATEWAY_PASSWORD}" "${JELLYFIN_ADMIN_PASSWORD}" > "${work}/secrets.pat" )
 for service in jellyfin gateway; do
   log_of "${service}" > "${work}/${service}.log"
   (( $(wc -l < "${work}/${service}.log") >= 3 )) || fail "the ${service} log is too short"
-  for secret in "${GATEWAY_PASSWORD}" "${JELLYFIN_ADMIN_PASSWORD}"; do
-    ! grep -qF -- "${secret}" "${work}/${service}.log" || fail "a password appears in the ${service} log"
-  done
+  ! grep -qFf "${work}/secrets.pat" "${work}/${service}.log" || fail "a password appears in the ${service} log"
 done
-"${engine}" exec "${jellyfin_id}" sh -c 'grep -rlF -- "$1" /data/jellyfin/log /data/jellyfin/config 2>/dev/null; true' sh "${JELLYFIN_ADMIN_PASSWORD}" > "${work}/hits"
-[[ ! -s "${work}/hits" ]] || fail "the admin password is stored in plain text under /data/jellyfin"
-jf_pid="$("${engine}" exec "${jellyfin_id}" sh -c 'for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = jellyfin ] && echo ${p#/proc/}; done; true' | head -1)"
-[[ -n "${jf_pid}" ]] || fail "no jellyfin process"
-names="$("${engine}" exec "${jellyfin_id}" sh -c "tr '\0' '\n' < /proc/${jf_pid}/environ | cut -d= -f1")"
-! grep -qx 'JELLYFIN_ADMIN_PASSWORD' <<<"${names}" || fail "Jellyfin holds JELLYFIN_ADMIN_PASSWORD"
+"${engine}" exec -i "${jellyfin_id}" sh -c 'grep -rlF -f - /data/jellyfin/log /data/jellyfin/config 2>/dev/null; true' < "${work}/secrets.pat" > "${work}/hits"
+[[ ! -s "${work}/hits" ]] || fail "a password is stored in plain text under /data/jellyfin"
+for proc in 1 jellyfin dufs; do
+  if [[ "${proc}" == 1 ]]; then pid=1; else
+    pid="$("${engine}" exec "${jellyfin_id}" sh -c "for p in /proc/[0-9]*; do [ \"\$(cat \$p/comm 2>/dev/null)\" = ${proc} ] && echo \${p#/proc/}; done; true" | head -1)"
+  fi
+  [[ -n "${pid}" ]] || fail "no ${proc} process"
+  names="$("${engine}" exec "${jellyfin_id}" sh -c "tr '\0' '\n' < /proc/${pid}/environ | cut -d= -f1")"
+  [[ -n "${names}" ]] || fail "could not read the environment of ${proc}"
+  ! grep -qx 'JELLYFIN_ADMIN_PASSWORD' <<<"${names}" || fail "${proc} (pid ${pid}) holds JELLYFIN_ADMIN_PASSWORD"
+done
 gnames="$("${engine}" exec --privileged "${gateway_id}" sh -c 'tr "\0" "\n" < /proc/1/environ | cut -d= -f1')"
 [[ -n "${gnames}" ]] || fail "could not read the gateway environment"
 ! grep -qxE 'GATEWAY_PASSWORD|GATEWAY_CONFIG' <<<"${gnames}" || fail "Caddy holds GATEWAY_PASSWORD or GATEWAY_CONFIG"
-echo "local-check: ok no password in logs, Jellyfin's stored config, or the Jellyfin and Caddy environments"
+echo "local-check: ok no password in logs, Jellyfin's stored files, or the wrapper, Jellyfin, dufs and Caddy environments"
 
 # Wrapper supervision: a dufs that exits makes the container exit nonzero.
 "${engine}" exec "${jellyfin_id}" sh -c 'kill $(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = dufs ] && echo ${p#/proc/}; done; true)'
@@ -132,4 +159,5 @@ for id in "${gateway_id}" "${jellyfin_id}"; do
   (( SECONDS - started < 20 )) || fail "a stop took $((SECONDS - started))s"
   echo "local-check: ok stopped in $((SECONDS - started))s with $("${engine}" inspect "${id}" --format '{{.State.Status}} {{.State.ExitCode}}')"
 done
+ENGINE="${engine}" IMAGE=docker.io/library/jellyfin-media-server:local ./scripts/interrupted-boot-check.sh
 echo "local-check: passed"

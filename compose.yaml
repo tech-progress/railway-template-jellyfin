@@ -33,6 +33,19 @@ services:
       GATEWAY_CONFIG: |
         {
           admin off
+          # Jellyfin accepts session tokens as ?api_key= and in X-Emby-* headers, and
+          # Caddy's error log records the request URI and headers. Caddy already
+          # redacts Authorization and Cookie.
+          log {
+            format filter {
+              request>uri regexp [?].* ?[redacted]
+              request>headers>Referer delete
+              request>headers>X-Emby-Token delete
+              request>headers>X-Emby-Authorization delete
+              request>headers>X-Mediabrowser-Token delete
+              resp_headers>Location delete
+            }
+          }
         }
         :8080 {
           handle /healthz {
@@ -51,7 +64,6 @@ services:
             reverse_proxy http://__JELLYFIN__ {
               header_up X-Forwarded-For {http.request.header.X-Real-IP}
               header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
-              header_up X-Forwarded-Host {host}
               header_up -Forwarded
             }
           }

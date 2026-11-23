@@ -10,7 +10,8 @@
 # completes the startup wizard with JELLYFIN_ADMIN_USERNAME and
 # JELLYFIN_ADMIN_PASSWORD, creates the three libraries, and stops it. Only then
 # does Jellyfin listen on 8096, the port the gateway and Railway's health check
-# use, so the open wizard is never reachable from the network.
+# use, so the open wizard is never reachable from the network. A boot after an
+# interrupted first boot resumes the same provisioning on loopback.
 #
 # Every boot: Jellyfin and the private dufs upload server run side by side. If
 # either exits, the other is stopped and the container exits nonzero so
@@ -25,6 +26,7 @@ media_dir="${data}/media"
 bootstrap_port=18096
 jellyfin_port=8096
 upload_port="${UPLOAD_PORT:-5001}"
+bootstrap_marker="${config_dir}/railway-bootstrap-network"
 
 fail() { echo "railway-entrypoint: $*" >&2; exit 64; }
 
@@ -69,6 +71,12 @@ write_network_config() {
   mv "${config_dir}/network.xml.tmp" "${config_dir}/network.xml"
 }
 
+finish_network_config() {
+  write_network_config "${jellyfin_port}" all
+  sync
+  rm -f "${bootstrap_marker:?}"
+}
+
 start_jellyfin() {
   # Proxy variables must not capture loopback calls, and the admin password
   # must not reach Jellyfin, plugins or ffmpeg.
@@ -90,14 +98,23 @@ json_string() {
   printf '"%s"' "${value}"
 }
 
-bootstrap() {
+# Provisioning is finished only when the marker is gone. It is created before
+# the first wizard call and removed after the libraries, encoding settings and
+# final network.xml are in place. Jellyfin itself marks the wizard complete on
+# start once its first user has a password, so the wizard flag alone cannot
+# tell an interrupted provisioning from a finished one.
+needs_provisioning() {
+  ! wizard_completed || [[ -e "${bootstrap_marker}" ]]
+}
+
+provision() {
   local username="${JELLYFIN_ADMIN_USERNAME:-}" password="${JELLYFIN_ADMIN_PASSWORD:-}"
   [[ "${username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || fail "JELLYFIN_ADMIN_USERNAME must be 1-64 letters, digits, dot, dash, underscore or @."
   (( ${#password} >= 16 )) || fail "JELLYFIN_ADMIN_PASSWORD must have at least 16 characters."
   [[ "${password}" != *[[:cntrl:]]* ]] || fail "JELLYFIN_ADMIN_PASSWORD must not contain control characters."
 
   local base="http://127.0.0.1:${bootstrap_port}" client='MediaBrowser Client="Railway bootstrap", Device="railway-entrypoint", DeviceId="railway-bootstrap", Version="1.0.0"'
-  local token="" code body
+  local token="" code body info
   # curl reads headers and bodies from descriptors, so neither the password
   # nor the session token appears in process arguments.
   call() {
@@ -108,41 +125,52 @@ bootstrap() {
       --config <(printf 'header = "Authorization: %s"\n' "${header//\"/\\\"}") \
       -H 'Content-Type: application/json' -X "${method}" --data-binary @- "${base}${path}"
   }
-  expect() { [[ "$1" == "$2" ]] || { echo "railway-entrypoint: bootstrap $3 returned HTTP $1" >&2; rm -f /tmp/bootstrap-response; exit 1; }; }
+  expect() { [[ "$1" == "$2" ]] || { echo "railway-entrypoint: provisioning $3 returned HTTP $1" >&2; rm -f /tmp/bootstrap-response; exit 1; }; }
 
-  echo "railway-entrypoint: first boot; running the Jellyfin startup wizard on 127.0.0.1:${bootstrap_port}."
+  if [[ -e "${bootstrap_marker}" ]]; then
+    echo "railway-entrypoint: an earlier first boot stopped before provisioning finished; resuming on 127.0.0.1:${bootstrap_port}."
+  else
+    echo "railway-entrypoint: first boot; running the Jellyfin startup wizard on 127.0.0.1:${bootstrap_port}."
+    : >"${bootstrap_marker}"
+  fi
   write_network_config "${bootstrap_port}" loopback
   start_jellyfin
   # Bash as PID 1 ignores TERM without a handler; stop Jellyfin cleanly if
-  # Railway stops the container mid-bootstrap. The next boot starts over.
+  # Railway stops the container mid-provisioning. The marker makes the next
+  # boot resume.
   trap 'stop_pid "${jellyfin_pid}"; exit 143' TERM INT
   # /health answers 200 "Degraded" while the migration server still runs and
   # the API returns 503, so wait for "Healthy" and the real public info.
   ready() {
     [[ "$(curl --noproxy '*' -fsS --max-time 5 "${base}/health" 2>/dev/null)" == Healthy ]] &&
-      curl --noproxy '*' -fsS --max-time 5 "${base}/System/Info/Public" 2>/dev/null | grep -q '"StartupWizardCompleted":false'
+      info="$(curl --noproxy '*' -fsS --max-time 5 "${base}/System/Info/Public" 2>/dev/null)" &&
+      [[ "${info}" == *'"StartupWizardCompleted":'* ]]
   }
   for _ in $(seq 300); do
     ready && break
-    kill -0 "${jellyfin_pid}" 2>/dev/null || { echo "railway-entrypoint: Jellyfin exited during bootstrap." >&2; exit 1; }
+    kill -0 "${jellyfin_pid}" 2>/dev/null || { echo "railway-entrypoint: Jellyfin exited during provisioning." >&2; exit 1; }
     sleep 2
   done
   ready || { echo "railway-entrypoint: Jellyfin did not become ready within 10 minutes." >&2; exit 1; }
 
-  code="$(printf '%s' '{"ServerName":"Media Server","UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' | call POST /Startup/Configuration)"
-  expect "${code}" 204 "server configuration"
-  # GET /Startup/User creates the initial user if none exists yet.
-  code="$(printf '' | call GET /Startup/User)"
-  expect "${code}" 200 "initial user lookup"
-  code="$(printf '{"Name":%s,"Password":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Startup/User)"
-  # 403 means an earlier, interrupted bootstrap already set the password; the
-  # sign-in below proves it is this deployment's password before going on.
-  [[ "${code}" == 204 || "${code}" == 403 ]] || expect "${code}" 204 "admin account"
-
+  if [[ "${info}" == *'"StartupWizardCompleted":false'* ]]; then
+    code="$(printf '%s' '{"ServerName":"Media Server","UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' | call POST /Startup/Configuration)"
+    expect "${code}" 204 "server configuration"
+    # GET /Startup/User creates the initial user if none exists yet.
+    code="$(printf '' | call GET /Startup/User)"
+    expect "${code}" 200 "initial user lookup"
+    code="$(printf '{"Name":%s,"Password":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Startup/User)"
+    # 403 means an interrupted earlier boot already set the password; the
+    # sign-in below proves it is this deployment's password before going on.
+    [[ "${code}" == 204 || "${code}" == 403 ]] || expect "${code}" 204 "admin account"
+  fi
+  # On a resumed provisioning with the wizard already complete, everything
+  # below needs this deployment's administrator; any other password stops here.
   code="$(printf '{"Username":%s,"Pw":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Users/AuthenticateByName)"
   expect "${code}" 200 "admin sign-in"
   token="$(sed -n 's/.*"AccessToken":"\([0-9a-fA-F]*\)".*/\1/p' /tmp/bootstrap-response)"
   [[ -n "${token}" ]] || { echo "railway-entrypoint: admin sign-in returned no token." >&2; exit 1; }
+  grep -q '"IsAdministrator":true' /tmp/bootstrap-response || { echo "railway-entrypoint: ${username} is not an administrator." >&2; exit 1; }
 
   code="$(printf '' | call GET /Library/VirtualFolders)"
   expect "${code}" 200 "library list"
@@ -157,30 +185,43 @@ bootstrap() {
   done
 
   # Software transcoding on shared CPUs: pause ffmpeg once the client has
-  # enough buffer and delete played segments so transcodes do not fill the volume.
+  # enough buffer, and let Jellyfin delete played HLS segments.
   code="$(printf '' | call GET /System/Configuration/encoding)"
   expect "${code}" 200 "encoding settings"
   body="$(sed -e 's/"EnableThrottling":false/"EnableThrottling":true/' -e 's/"EnableSegmentDeletion":false/"EnableSegmentDeletion":true/' /tmp/bootstrap-response)"
   code="$(printf '%s' "${body}" | call POST /System/Configuration/encoding)"
   expect "${code}" 204 "encoding update"
+  code="$(printf '' | call GET /System/Configuration/encoding)"
+  expect "${code}" 200 "encoding readback"
+  grep -q '"EnableThrottling":true' /tmp/bootstrap-response && grep -q '"EnableSegmentDeletion":true' /tmp/bootstrap-response ||
+    { echo "railway-entrypoint: the encoding settings did not persist." >&2; exit 1; }
 
   code="$(printf '' | call POST /Startup/Complete)"
   expect "${code}" 204 "wizard completion"
   code="$(printf '' | call POST /Sessions/Logout)"
-  expect "${code}" 204 "bootstrap sign-out"
+  expect "${code}" 204 "provisioning sign-out"
   token=""
   rm -f /tmp/bootstrap-response
 
   stop_pid "${jellyfin_pid}"
+  trap - TERM INT
   wizard_completed || { echo "railway-entrypoint: Jellyfin did not record the completed wizard." >&2; exit 1; }
-  write_network_config "${jellyfin_port}" all
+  finish_network_config
   echo "railway-entrypoint: startup wizard completed for admin user ${username}; libraries Movies, Shows and Music created."
 }
 
-if ! wizard_completed; then
-  bootstrap
+# Railway delivers the generated password in this process's environment. Use
+# it only for provisioning, then replace this shell with one whose environment
+# (and /proc/1/environ) no longer holds it.
+if [[ -n "${JELLYFIN_ADMIN_PASSWORD+x}" ]]; then
+  if needs_provisioning; then
+    provision
+  fi
+  exec env -u JELLYFIN_ADMIN_PASSWORD "$0" "$@"
 fi
-unset JELLYFIN_ADMIN_PASSWORD
+if needs_provisioning; then
+  fail "provisioning is not finished and JELLYFIN_ADMIN_PASSWORD is not set."
+fi
 
 dufs "${media_dir}" \
   --bind 0.0.0.0 --bind :: \

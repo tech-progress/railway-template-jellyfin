@@ -5,7 +5,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-for file in .dockerignore .env.example .gitignore .railway/railway.ts CHANGELOG.md Dockerfile LICENSE_REVIEW.md MARKETPLACE.md PUBLISHING.md README.md SUPPORT.md UPGRADE.md VERSION bun.lock compose.yaml package.json railway-entrypoint.sh template-defaults.json template-descriptions.json template-networking.json template-volumes.json scripts/audit-template.sh scripts/check-standalone.sh scripts/iac-graph.sh scripts/local-check.sh scripts/restore-template-draft.sh scripts/smoke.sh scripts/test-audit.sh; do
+for file in .dockerignore .env.example .gitignore .railway/railway.ts CHANGELOG.md Dockerfile LICENSE_REVIEW.md MARKETPLACE.md PUBLISHING.md README.md SUPPORT.md UPGRADE.md VERSION bun.lock compose.yaml package.json railway-entrypoint.sh template-defaults.json template-descriptions.json template-networking.json template-volumes.json scripts/audit-template.sh scripts/check-standalone.sh scripts/iac-graph.sh scripts/interrupted-boot-check.sh scripts/local-check.sh scripts/deploy-stored-template.sh scripts/project-status.sh scripts/wait-deployment.sh scripts/restore-template-draft.sh scripts/smoke.sh scripts/test-audit.sh; do
   [[ -f "${root}/${file}" ]] || fail "missing ${file}"
 done
 
@@ -57,6 +57,9 @@ grep -Fq 'handle /files* {' <<<"${policy}" || fail "policy lacks the /files hand
 ! grep -Eq '^\s*route\b' <<<"${policy}" || fail "use handle blocks only; Caddy sorts handle before route"
 grep -Fq 'header_up X-Forwarded-For {http.request.header.X-Real-IP}' <<<"${policy}" || fail "policy must forward Railway's client address"
 grep -Fq 'header_up -Authorization' <<<"${policy}" || fail "policy must strip the Basic credential before dufs"
+for filter in 'request>uri regexp [?].* ?[redacted]' 'request>headers>Referer delete' 'request>headers>X-Emby-Token delete' 'resp_headers>Location delete'; do
+  grep -Fq "${filter}" <<<"${policy}" || fail "policy log filter lacks: ${filter}"
+done
 
 for heading in '# Deploy and Host' '## About Hosting' '## Why Deploy' '## Common Use Cases' '## Dependencies for' '### Deployment Dependencies'; do
   grep -q "^${heading}" "${root}/MARKETPLACE.md" || fail "MARKETPLACE.md lacks ${heading}"
