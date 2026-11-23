@@ -29,6 +29,7 @@ cache_dir="${data}/cache"
 media_dir="${data}/media"
 bootstrap_port=18096
 jellyfin_port=8096
+curl_pid=""
 upload_port="${UPLOAD_PORT:-5001}"
 bootstrap_marker="${config_dir}/railway-bootstrap-network"
 
@@ -139,14 +140,27 @@ provision() {
   local base="http://127.0.0.1:${bootstrap_port}" client='MediaBrowser Client="Railway bootstrap", Device="railway-entrypoint", DeviceId="railway-bootstrap", Version="1.0.0"'
   local token="" code body info
   # curl reads headers and bodies from descriptors, so neither the password
-  # nor the session token appears in process arguments.
+  # nor the session token appears in process arguments. Each request runs in
+  # the background and is awaited with the `wait` builtin: bash defers a trap
+  # until a foreground command or command substitution ends, but `wait`
+  # returns at once when a signal arrives, so a stop is never held up by a
+  # request.
+  bg_curl() {
+    local rc=0
+    curl --noproxy '*' "$@" &
+    curl_pid=$!
+    wait "${curl_pid}" || rc=$?
+    curl_pid=""
+    return "${rc}"
+  }
   call() {
-    local method="$1" path="$2"
-    local header="${client}"
+    local method="$1" path="$2" body="${3:-}" header="${client}"
     [[ -z "${token}" ]] || header+=", Token=\"${token}\""
-    curl --noproxy '*' --silent --show-error --max-time 60 --output /tmp/bootstrap-response --write-out '%{http_code}' \
+    code=000
+    bg_curl --silent --show-error --max-time 60 --output /tmp/bootstrap-response --write-out '%{http_code}' \
       --config <(printf 'header = "Authorization: %s"\n' "${header//\"/\\\"}") \
-      -H 'Content-Type: application/json' -X "${method}" --data-binary @- "${base}${path}"
+      -H 'Content-Type: application/json' -X "${method}" --data-binary @<(printf '%s' "${body}") "${base}${path}" >/tmp/bootstrap-code || true
+    read -r code </tmp/bootstrap-code || true
   }
   expect() { [[ "$1" == "$2" ]] || { echo "railway-entrypoint: provisioning $3 returned HTTP $1" >&2; rm -f /tmp/bootstrap-response; exit 1; }; }
 
@@ -161,70 +175,76 @@ provision() {
   # Bash as PID 1 ignores TERM without a handler; stop Jellyfin cleanly if
   # Railway stops the container mid-provisioning. The marker makes the next
   # boot resume.
-  trap 'stop_children "${jellyfin_pid}"; exit 143' TERM INT
+  trap '[[ -z "${curl_pid}" ]] || kill "${curl_pid}" 2>/dev/null; stop_children "${jellyfin_pid}"; exit 143' TERM INT
   # /health answers 200 "Degraded" while the migration server still runs and
   # the API returns 503, so wait for "Healthy" and the real public info.
   ready() {
-    [[ "$(curl --noproxy '*' -fsS --max-time 5 "${base}/health" 2>/dev/null)" == Healthy ]] &&
-      info="$(curl --noproxy '*' -fsS --max-time 5 "${base}/System/Info/Public" 2>/dev/null)" &&
-      [[ "${info}" == *'"StartupWizardCompleted":'* ]]
+    local health=""
+    info=""
+    bg_curl -fsS --max-time 3 -o /tmp/bootstrap-health "${base}/health" 2>/dev/null || return 1
+    read -r health </tmp/bootstrap-health || true
+    [[ "${health}" == Healthy ]] || return 1
+    bg_curl -fsS --max-time 3 -o /tmp/bootstrap-health "${base}/System/Info/Public" 2>/dev/null || return 1
+    read -r info </tmp/bootstrap-health || true
+    [[ "${info}" == *'"StartupWizardCompleted":'* ]]
   }
   for _ in $(seq 300); do
     ready && break
     kill -0 "${jellyfin_pid}" 2>/dev/null || { echo "railway-entrypoint: Jellyfin exited during provisioning." >&2; exit 1; }
-    sleep 2
+    sleep 2 &
+    wait "$!" || true
   done
   ready || { echo "railway-entrypoint: Jellyfin did not become ready within 10 minutes." >&2; exit 1; }
 
   if [[ "${info}" == *'"StartupWizardCompleted":false'* ]]; then
-    code="$(printf '%s' '{"ServerName":"Media Server","UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' | call POST /Startup/Configuration)"
+    call POST /Startup/Configuration '{"ServerName":"Media Server","UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}'
     expect "${code}" 204 "server configuration"
     # GET /Startup/User creates the initial user if none exists yet.
-    code="$(printf '' | call GET /Startup/User)"
+    call GET /Startup/User
     expect "${code}" 200 "initial user lookup"
-    code="$(printf '{"Name":%s,"Password":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Startup/User)"
+    call POST /Startup/User "$(printf '{"Name":%s,"Password":%s}' "$(json_string "${username}")" "$(json_string "${password}")")"
     # 403 means an interrupted earlier boot already set the password; the
     # sign-in below proves it is this deployment's password before going on.
     [[ "${code}" == 204 || "${code}" == 403 ]] || expect "${code}" 204 "admin account"
   fi
   # On a resumed provisioning with the wizard already complete, everything
   # below needs this deployment's administrator; any other password stops here.
-  code="$(printf '{"Username":%s,"Pw":%s}' "$(json_string "${username}")" "$(json_string "${password}")" | call POST /Users/AuthenticateByName)"
+  call POST /Users/AuthenticateByName "$(printf '{"Username":%s,"Pw":%s}' "$(json_string "${username}")" "$(json_string "${password}")")"
   expect "${code}" 200 "admin sign-in"
   token="$(sed -n 's/.*"AccessToken":"\([0-9a-fA-F]*\)".*/\1/p' /tmp/bootstrap-response)"
   [[ -n "${token}" ]] || { echo "railway-entrypoint: admin sign-in returned no token." >&2; exit 1; }
   grep -q '"IsAdministrator":true' /tmp/bootstrap-response || { echo "railway-entrypoint: ${username} is not an administrator." >&2; exit 1; }
 
-  code="$(printf '' | call GET /Library/VirtualFolders)"
+  call GET /Library/VirtualFolders
   expect "${code}" 200 "library list"
   body="$(cat /tmp/bootstrap-response)"
   local library name collection path
   for library in "Movies:movies:${media_dir}/movies" "Shows:tvshows:${media_dir}/shows" "Music:music:${media_dir}/music"; do
     IFS=: read -r name collection path <<<"${library}"
     grep -q "\"Name\":\"${name}\"" <<<"${body}" && continue
-    code="$(printf '{"LibraryOptions":{"EnableRealtimeMonitor":true,"PathInfos":[{"Path":"%s"}]}}' "${path}" |
-      call POST "/Library/VirtualFolders?name=${name}&collectionType=${collection}&refreshLibrary=false")"
+    call POST "/Library/VirtualFolders?name=${name}&collectionType=${collection}&refreshLibrary=false" \
+      "$(printf '{"LibraryOptions":{"EnableRealtimeMonitor":true,"PathInfos":[{"Path":"%s"}]}}' "${path}")"
     expect "${code}" 204 "library ${name}"
   done
 
   # Software transcoding on shared CPUs: pause ffmpeg once the client has
   # enough buffer, and let Jellyfin delete played HLS segments.
-  code="$(printf '' | call GET /System/Configuration/encoding)"
+  call GET /System/Configuration/encoding
   expect "${code}" 200 "encoding settings"
   body="$(sed -e 's/"EnableThrottling":false/"EnableThrottling":true/' -e 's/"EnableSegmentDeletion":false/"EnableSegmentDeletion":true/' /tmp/bootstrap-response)"
-  code="$(printf '%s' "${body}" | call POST /System/Configuration/encoding)"
+  call POST /System/Configuration/encoding "${body}"
   expect "${code}" 204 "encoding update"
-  code="$(printf '' | call GET /System/Configuration/encoding)"
+  call GET /System/Configuration/encoding
   expect "${code}" 200 "encoding readback"
   grep -q '"EnableThrottling":true' /tmp/bootstrap-response && grep -q '"EnableSegmentDeletion":true' /tmp/bootstrap-response ||
     { echo "railway-entrypoint: the encoding settings did not persist." >&2; exit 1; }
 
-  code="$(printf '' | call POST /Startup/Complete)"
+  call POST /Startup/Complete
   expect "${code}" 204 "wizard completion"
-  code="$(printf '' | call POST /Sessions/Logout)"
+  call POST /Sessions/Logout
   expect "${code}" 204 "provisioning sign-out"
   token=""
-  rm -f /tmp/bootstrap-response
+  rm -f /tmp/bootstrap-response /tmp/bootstrap-code /tmp/bootstrap-health
 
   stop_children "${jellyfin_pid}"
   trap 'exit 143' TERM INT

@@ -121,3 +121,27 @@ term_early "provisioned volume"
 "${engine}" volume create "${name}-term" >/dev/null
 "${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" --env-file "${work}/env" "${image}" >/dev/null
 term_early "fresh volume"
+
+# Case 4. TERM while a provisioning request is in flight. A curl first on PATH
+# that stalls the /Startup/Configuration request for 50 seconds stands in for
+# a slow Jellyfin; the container must still stop within 25 seconds.
+"${engine}" rm -fv "${name}-term" >/dev/null
+"${engine}" volume rm -f "${name}-term" >/dev/null
+printf '#!/bin/sh\ncase "$*" in *Startup/Configuration*) echo "fake curl: stalling the wizard request" >&2; sleep 50;; esac\nexec /usr/bin/curl "$@"\n' > "${work}/curl"
+chmod 0755 "${work}/curl"
+"${engine}" volume create "${name}-term" >/dev/null
+"${engine}" run -d --name "${name}-term" --memory 1536m --cpus 2 -v "${name}-term:/data" -v "${work}/curl:/usr/local/bin/curl:ro,Z" --env-file "${work}/env" "${image}" >/dev/null
+for _ in $(seq 150); do
+  "${engine}" logs "${name}-term" 2>&1 | grep -q 'fake curl: stalling' && break
+  sleep 2
+done
+"${engine}" logs "${name}-term" 2>&1 | grep -q 'fake curl: stalling' || fail "provisioning never reached the wizard request"
+started=${SECONDS}
+"${engine}" kill -s TERM "${name}-term" >/dev/null
+for _ in $(seq 40); do
+  [[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && break
+  sleep 1
+done
+[[ "$("${engine}" inspect "${name}-term" --format '{{.State.Running}}')" == false ]] && (( SECONDS - started <= 25 )) ||
+  fail "TERM during a provisioning request took $((SECONDS - started))s or more to stop the container"
+echo "interrupted-boot-check: ok TERM during a stalled provisioning request stopped the container in $((SECONDS - started))s (exit $("${engine}" inspect "${name}-term" --format '{{.State.ExitCode}}'))"
